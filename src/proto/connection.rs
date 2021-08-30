@@ -1,6 +1,6 @@
 use crate::codec::{RecvError, UserError};
 use crate::frame::{Reason, StreamId};
-use crate::{client, frame, proto, server};
+use crate::{client, frame, server};
 
 use crate::frame::DEFAULT_INITIAL_WINDOW_SIZE;
 use crate::proto::*;
@@ -40,7 +40,7 @@ where
     ///
     /// This exists separately from State in order to support
     /// graceful shutdown.
-    error: Option<Reason>,
+    error: Option<frame::GoAway>,
 
     /// Pending GOAWAY frames to write.
     go_away: GoAway,
@@ -68,7 +68,7 @@ struct DynConnection<'a, B: Buf = Bytes> {
 
     streams: DynStreams<'a, B>,
 
-    error: &'a mut Option<Reason>,
+    error: &'a mut Option<frame::GoAway>,
 
     ping_pong: &'a mut PingPong,
 }
@@ -161,9 +161,9 @@ where
 
     /// Returns `Ready` when the connection is ready to receive a frame.
     ///
-    /// Returns `RecvError` as this may raise errors that are caused by delayed
+    /// Returns `Error` as this may raise errors that are caused by delayed
     /// processing of received frames.
-    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), RecvError>> {
+    fn poll_ready(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         let _e = self.inner.span.enter();
         let span = tracing::trace_span!("poll_ready");
         let _e = span.enter();
@@ -191,26 +191,18 @@ where
         self.inner.as_dyn().go_away_from_user(e)
     }
 
-    fn take_error(&mut self, ours: Reason) -> Poll<Result<(), proto::Error>> {
-        let reason = if let Some(theirs) = self.inner.error.take() {
-            match (ours, theirs) {
-                // If either side reported an error, return that
-                // to the user.
-                (Reason::NO_ERROR, err) | (err, Reason::NO_ERROR) => err,
-                // If both sides reported an error, give their
-                // error back to th user. We assume our error
-                // was a consequence of their error, and less
-                // important.
-                (_, theirs) => theirs,
-            }
-        } else {
-            ours
-        };
+    fn take_error(&mut self, ours: Reason) -> Result<(), Error> {
+        let theirs = self
+            .inner
+            .error
+            .take()
+            .as_ref()
+            .map_or(Reason::NO_ERROR, frame::GoAway::reason);
 
-        if reason == Reason::NO_ERROR {
-            Poll::Ready(Ok(()))
-        } else {
-            Poll::Ready(Err(proto::Error::Proto(reason)))
+        match (ours, theirs) {
+            (Reason::NO_ERROR, Reason::NO_ERROR) => Ok(()),
+            (ours, Reason::NO_ERROR) => Err(Error::Ours(ours)),
+            (_, theirs) => Err(Error::Theirs(theirs)),
         }
     }
 
@@ -229,7 +221,7 @@ where
     }
 
     /// Advances the internal state of the connection.
-    pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), proto::Error>> {
+    pub fn poll(&mut self, cx: &mut Context) -> Poll<Result<(), Error>> {
         // XXX(eliza): cloning the span is unfortunately necessary here in
         // order to placate the borrow checker — `self` is mutably borrowed by
         // `poll2`, which means that we can't borrow `self.span` to enter it.
@@ -276,7 +268,7 @@ where
                     // Transition the state to error
                     self.inner.state = State::Closed(reason);
                 }
-                State::Closed(reason) => return self.take_error(reason),
+                State::Closed(reason) => return Poll::Ready(self.take_error(reason)),
             }
         }
     }
@@ -300,7 +292,7 @@ where
                         // the same error back to the user.
                         return Poll::Ready(Ok(()));
                     } else {
-                        return Poll::Ready(Err(RecvError::Connection(reason)));
+                        return Poll::Ready(Err(RecvError::Connection(Error::Theirs(reason))));
                     }
                 }
                 // Only NO_ERROR should be waiting for idle
@@ -384,11 +376,10 @@ where
         self.go_away.go_away_from_user(frame);
 
         // Notify all streams of reason we're abruptly closing.
-        self.streams.recv_err(&proto::Error::Proto(e));
+        self.streams.handle_error(&Error::Ours(e));
     }
 
     fn handle_poll2_result(&mut self, result: Result<(), RecvError>) -> Result<(), Error> {
-        use crate::codec::RecvError::*;
         match result {
             // The connection has shutdown normally
             Ok(()) => {
@@ -398,28 +389,16 @@ where
             // Attempting to read a frame resulted in a connection level
             // error. This is handled by setting a GOAWAY frame followed by
             // terminating the connection.
-            Err(Connection(e)) => {
-                tracing::debug!(error = ?e, "Connection::poll; connection error");
-
-                // We may have already sent a GOAWAY for this error,
-                // if so, don't send another, just flush and close up.
-                if let Some(reason) = self.go_away.going_away_reason() {
-                    if reason == e {
-                        tracing::trace!("    -> already going away");
-                        *self.state = State::Closing(e);
-                        return Ok(());
-                    }
-                }
-
-                // Reset all active streams
-                self.streams.recv_err(&e.into());
-                self.go_away_now(e);
-                Ok(())
+            Err(RecvError::Connection(Error::Ours(e))) => {
+                Ok(self.handle_error_with_reason(e, Error::Ours))
+            }
+            Err(RecvError::Connection(Error::Theirs(e))) => {
+                Ok(self.handle_error_with_reason(e, Error::Theirs))
             }
             // Attempting to read a frame resulted in a stream level error.
             // This is handled by resetting the frame then trying to read
             // another frame.
-            Err(Stream { id, reason }) => {
+            Err(RecvError::Stream { id, reason }) => {
                 tracing::trace!(?id, ?reason, "stream error");
                 self.streams.send_reset(id, reason);
                 Ok(())
@@ -428,17 +407,37 @@ where
             // active streams must be reset.
             //
             // TODO: Are I/O errors recoverable?
-            Err(Io(e)) => {
+            Err(RecvError::Connection(Error::Io(e))) => {
                 tracing::debug!(error = ?e, "Connection::poll; IO error");
                 let e = e.into();
 
                 // Reset all active streams
-                self.streams.recv_err(&e);
+                self.streams.handle_error(&e);
 
                 // Return the error
                 Err(e)
             }
         }
+    }
+
+    fn handle_error_with_reason<F>(&mut self, reason: Reason, ctor: F)
+    where
+        F: FnOnce(Reason) -> Error,
+    {
+        let e = ctor(reason);
+        tracing::debug!(error = ?e, "Connection::poll; connection error");
+
+        // We may have already sent a GOAWAY for this error,
+        // if so, don't send another, just flush and close up.
+        if self.go_away.going_away_reason() == Some(reason) {
+            tracing::trace!("    -> already going away");
+            *self.state = State::Closing(reason);
+            return;
+        }
+
+        // Reset all active streams
+        self.streams.handle_error(&e);
+        self.go_away_now(reason);
     }
 
     fn recv_frame(&mut self, frame: Option<Frame>) -> Result<ReceivedFrame, RecvError> {
@@ -471,7 +470,7 @@ where
                 // until they are all EOS. Once they are, State should
                 // transition to GoAway.
                 self.streams.recv_go_away(&frame)?;
-                *self.error = Some(frame.reason());
+                *self.error = Some(frame);
             }
             Some(Ping(frame)) => {
                 tracing::trace!(?frame, "recv PING");

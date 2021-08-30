@@ -207,13 +207,13 @@ async fn errors_if_recv_frame_exceeds_max_frame_size() {
             let body = resp.into_parts().1;
             let res = util::concat(body).await;
             let err = res.unwrap_err();
-            assert_eq!(err.to_string(), "protocol error: frame with invalid size");
+            assert_eq!(err.to_string(), "local error: frame with invalid size");
         };
 
         // client should see a conn error
         let conn = async move {
             let err = h2.await.unwrap_err();
-            assert_eq!(err.to_string(), "protocol error: frame with invalid size");
+            assert_eq!(err.to_string(), "local error: frame with invalid size");
         };
         join(conn, req).await;
     };
@@ -321,7 +321,7 @@ async fn recv_goaway_finishes_processed_streams() {
         // this request will trigger a goaway
         let req2 = async move {
             let err = client.get("https://example.com/").await.unwrap_err();
-            assert_eq!(err.to_string(), "protocol error: not a result of an error");
+            assert_eq!(err.to_string(), "remote error: not a result of an error");
         };
 
         join3(async move { h2.await.expect("client") }, req1, req2).await;

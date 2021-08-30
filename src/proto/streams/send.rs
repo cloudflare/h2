@@ -2,8 +2,9 @@ use super::{
     store, Buffer, Codec, Config, Counts, Frame, Prioritize, Prioritized, Store, Stream, StreamId,
     StreamIdOverflow, WindowSize,
 };
-use crate::codec::{RecvError, UserError};
+use crate::codec::UserError;
 use crate::frame::{self, Reason};
+use crate::proto::Error;
 
 use bytes::Buf;
 use http;
@@ -379,7 +380,7 @@ impl Send {
         Ok(())
     }
 
-    pub(super) fn recv_go_away(&mut self, last_stream_id: StreamId) -> Result<(), RecvError> {
+    pub(super) fn recv_go_away(&mut self, last_stream_id: StreamId) -> Result<(), Error> {
         if last_stream_id > self.max_stream_id {
             // The remote endpoint sent a `GOAWAY` frame indicating a stream
             // that we never sent, or that we have already terminated on account
@@ -392,14 +393,14 @@ impl Send {
                 "recv_go_away: last_stream_id ({:?}) > max_stream_id ({:?})",
                 last_stream_id, self.max_stream_id,
             );
-            return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+            return Err(Error::Ours(Reason::PROTOCOL_ERROR));
         }
 
         self.max_stream_id = last_stream_id;
         Ok(())
     }
 
-    pub fn recv_err<B>(
+    pub fn handle_error<B>(
         &mut self,
         buffer: &mut Buffer<Frame<B>>,
         stream: &mut store::Ptr,
@@ -417,7 +418,7 @@ impl Send {
         store: &mut Store,
         counts: &mut Counts,
         task: &mut Option<Waker>,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         // Applies an update to the remote endpoint's initial window size.
         //
         // Per RFC 7540 §6.9.2:
@@ -480,7 +481,7 @@ impl Send {
                     // of a stream is reduced? Maybe it should if the capacity
                     // is reduced to zero, allowing the producer to stop work.
 
-                    Ok::<_, RecvError>(())
+                    Ok::<_, Error>(())
                 })?;
 
                 self.prioritize
@@ -490,7 +491,7 @@ impl Send {
 
                 store.for_each(|mut stream| {
                     self.recv_stream_window_update(inc, buffer, &mut stream, counts, task)
-                        .map_err(RecvError::Connection)
+                        .map_err(Error::Ours)
                 })?;
             }
         }

@@ -1,9 +1,8 @@
 use std::io;
 
-use crate::codec::UserError::*;
-use crate::codec::{RecvError, UserError};
+use crate::codec::UserError;
 use crate::frame::{self, Reason};
-use crate::proto::{self, PollReset};
+use crate::proto::{self, Error, PollReset};
 
 use self::Inner::*;
 use self::Peer::*;
@@ -74,7 +73,7 @@ enum Peer {
 #[derive(Debug, Copy, Clone)]
 enum Cause {
     EndStream,
-    Proto(Reason),
+    RemotelyReset(Reason),
     LocallyReset(Reason),
     Io,
 
@@ -123,7 +122,7 @@ impl State {
             }
             _ => {
                 // All other transitions result in a protocol error
-                return Err(UnexpectedFrameType);
+                return Err(UserError::UnexpectedFrameType);
             }
         };
 
@@ -133,7 +132,7 @@ impl State {
     /// Opens the receive-half of the stream when a HEADERS frame is received.
     ///
     /// Returns true if this transitions the state to Open.
-    pub fn recv_open(&mut self, frame: &frame::Headers) -> Result<bool, RecvError> {
+    pub fn recv_open(&mut self, frame: &frame::Headers) -> Result<bool, Error> {
         let mut initial = false;
         let eos = frame.is_end_stream();
 
@@ -198,7 +197,7 @@ impl State {
             state => {
                 // All other transitions result in a protocol error
                 proto_err!(conn: "recv_open: in unexpected state {:?}", state);
-                return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+                return Err(Error::Ours(Reason::PROTOCOL_ERROR));
             }
         };
 
@@ -206,7 +205,7 @@ impl State {
     }
 
     /// Transition from Idle -> ReservedRemote
-    pub fn reserve_remote(&mut self) -> Result<(), RecvError> {
+    pub fn reserve_remote(&mut self) -> Result<(), Error> {
         match self.inner {
             Idle => {
                 self.inner = ReservedRemote;
@@ -214,7 +213,7 @@ impl State {
             }
             state => {
                 proto_err!(conn: "reserve_remote: in unexpected state {:?}", state);
-                Err(RecvError::Connection(Reason::PROTOCOL_ERROR))
+                Err(Error::Ours(Reason::PROTOCOL_ERROR))
             }
         }
     }
@@ -231,7 +230,7 @@ impl State {
     }
 
     /// Indicates that the remote side will not send more data to the local.
-    pub fn recv_close(&mut self) -> Result<(), RecvError> {
+    pub fn recv_close(&mut self) -> Result<(), Error> {
         match self.inner {
             Open { local, .. } => {
                 // The remote side will continue to receive data.
@@ -246,7 +245,7 @@ impl State {
             }
             state => {
                 proto_err!(conn: "recv_close: in unexpected state {:?}", state);
-                Err(RecvError::Connection(Reason::PROTOCOL_ERROR))
+                Err(Error::Ours(Reason::PROTOCOL_ERROR))
             }
         }
     }
@@ -254,9 +253,9 @@ impl State {
     /// The remote explicitly sent a RST_STREAM.
     ///
     /// # Arguments
-    /// - `reason`: the reason field of the received RST_STREAM frame.
+    /// - `frame`: the received RST_STREAM frame.
     /// - `queued`: true if this stream has frames in the pending send queue.
-    pub fn recv_reset(&mut self, reason: Reason, queued: bool) {
+    pub fn recv_reset(&mut self, frame: frame::Reset, queued: bool) {
         match self.inner {
             // If the stream is already in a `Closed` state, do nothing,
             // provided that there are no frames still in the send queue.
@@ -277,27 +276,26 @@ impl State {
             // will be cleared by `Prioritize::pop_frame`.
             state => {
                 tracing::trace!(
-                    "recv_reset; reason={:?}; state={:?}; queued={:?}",
-                    reason,
+                    "recv_reset; frame={:?}; state={:?}; queued={:?}",
+                    frame,
                     state,
                     queued
                 );
-                self.inner = Closed(Cause::Proto(reason));
+                self.inner = Closed(Cause::RemotelyReset(frame.reason()));
             }
         }
     }
 
-    /// We noticed a protocol error.
-    pub fn recv_err(&mut self, err: &proto::Error) {
-        use crate::proto::Error::*;
-
+    /// Handle a connection-level error.
+    pub fn handle_error(&mut self, err: &proto::Error) {
         match self.inner {
             Closed(..) => {}
             _ => {
-                tracing::trace!("recv_err; err={:?}", err);
+                tracing::trace!("handle_error; err={:?}", err);
                 self.inner = Closed(match *err {
-                    Proto(reason) => Cause::LocallyReset(reason),
-                    Io(..) => Cause::Io,
+                    Error::Ours(reason) => Cause::LocallyReset(reason),
+                    Error::Theirs(reason) => Cause::RemotelyReset(reason),
+                    Error::Io(..) => Cause::Io,
                 });
             }
         }
@@ -436,9 +434,10 @@ impl State {
     pub fn ensure_recv_open(&self) -> Result<bool, proto::Error> {
         // TODO: Is this correct?
         match self.inner {
-            Closed(Cause::Proto(reason))
-            | Closed(Cause::LocallyReset(reason))
-            | Closed(Cause::Scheduled(reason)) => Err(proto::Error::Proto(reason)),
+            Closed(Cause::RemotelyReset(reason)) => Err(proto::Error::Theirs(reason)),
+            Closed(Cause::LocallyReset(reason)) | Closed(Cause::Scheduled(reason)) => {
+                Err(proto::Error::Ours(reason))
+            }
             Closed(Cause::Io) => Err(proto::Error::Io(io::ErrorKind::BrokenPipe.into())),
             Closed(Cause::EndStream) | HalfClosedRemote(..) | ReservedLocal => Ok(false),
             _ => Ok(true),
@@ -448,7 +447,7 @@ impl State {
     /// Returns a reason if the stream has been reset.
     pub(super) fn ensure_reason(&self, mode: PollReset) -> Result<Option<Reason>, crate::Error> {
         match self.inner {
-            Closed(Cause::Proto(reason))
+            Closed(Cause::RemotelyReset(reason))
             | Closed(Cause::LocallyReset(reason))
             | Closed(Cause::Scheduled(reason)) => Ok(Some(reason)),
             Closed(Cause::Io) => Err(proto::Error::Io(io::ErrorKind::BrokenPipe.into()).into()),

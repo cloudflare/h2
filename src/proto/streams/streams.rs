@@ -3,7 +3,7 @@ use super::store::{self, Entry, Resolve, Store};
 use super::{Buffer, Config, Counts, Prioritized, Recv, Send, Stream, StreamId};
 use crate::codec::{Codec, RecvError, SendError, UserError};
 use crate::frame::{self, Frame, Reason};
-use crate::proto::{peer, Open, Peer, WindowSize};
+use crate::proto::{peer, Error, Open, Peer, WindowSize};
 use crate::{client, proto, server};
 
 use bytes::{Buf, Bytes};
@@ -180,7 +180,7 @@ where
         me.poll_complete(&self.send_buffer, cx, dst)
     }
 
-    pub fn apply_remote_settings(&mut self, frame: &frame::Settings) -> Result<(), RecvError> {
+    pub fn apply_remote_settings(&mut self, frame: &frame::Settings) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -198,7 +198,7 @@ where
         )
     }
 
-    pub fn apply_local_settings(&mut self, frame: &frame::Settings) -> Result<(), RecvError> {
+    pub fn apply_local_settings(&mut self, frame: &frame::Settings) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         let me = &mut *me;
 
@@ -308,16 +308,16 @@ impl<B> DynStreams<'_, B> {
         me.recv_data(self.peer, &self.send_buffer, frame)
     }
 
-    pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), RecvError> {
+    pub fn recv_reset(&mut self, frame: frame::Reset) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
 
         me.recv_reset(&self.send_buffer, frame)
     }
 
-    /// Handle a received error and return the ID of the last processed stream.
-    pub fn recv_err(&mut self, err: &proto::Error) -> StreamId {
+    /// Notify all streams that a connection-level error happened.
+    pub fn handle_error(&mut self, err: &proto::Error) -> StreamId {
         let mut me = self.inner.lock().unwrap();
-        me.recv_err(&self.send_buffer, err)
+        me.handle_error(&self.send_buffer, err)
     }
 
     pub fn recv_go_away(&mut self, frame: &frame::GoAway) -> Result<(), RecvError> {
@@ -329,7 +329,7 @@ impl<B> DynStreams<'_, B> {
         self.inner.lock().unwrap().actions.recv.last_processed_id()
     }
 
-    pub fn recv_window_update(&mut self, frame: frame::WindowUpdate) -> Result<(), RecvError> {
+    pub fn recv_window_update(&mut self, frame: frame::WindowUpdate) -> Result<(), Error> {
         let mut me = self.inner.lock().unwrap();
         me.recv_window_update(&self.send_buffer, frame)
     }
@@ -536,7 +536,7 @@ impl Inner {
                 }
 
                 proto_err!(conn: "recv_data: stream not found; id={:?}", id);
-                return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+                return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
             }
         };
 
@@ -564,12 +564,12 @@ impl Inner {
         &mut self,
         send_buffer: &SendBuffer<B>,
         frame: frame::Reset,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         let id = frame.stream_id();
 
         if id.is_zero() {
             proto_err!(conn: "recv_reset: invalid stream ID 0");
-            return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+            return Err(Error::Ours(Reason::PROTOCOL_ERROR));
         }
 
         // The GOAWAY process has begun. All streams with a greater ID than
@@ -589,7 +589,7 @@ impl Inner {
                 // TODO: Are there other error cases?
                 self.actions
                     .ensure_not_idle(self.counts.peer(), id)
-                    .map_err(RecvError::Connection)?;
+                    .map_err(Error::Ours)?;
 
                 return Ok(());
             }
@@ -602,7 +602,7 @@ impl Inner {
 
         self.counts.transition(stream, |counts, stream| {
             actions.recv.recv_reset(frame, stream);
-            actions.send.recv_err(send_buffer, stream, counts);
+            actions.send.handle_error(send_buffer, stream, counts);
             assert!(stream.state.is_closed());
             Ok(())
         })
@@ -612,7 +612,7 @@ impl Inner {
         &mut self,
         send_buffer: &SendBuffer<B>,
         frame: frame::WindowUpdate,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), Error> {
         let id = frame.stream_id();
 
         let mut send_buffer = send_buffer.inner.lock().unwrap();
@@ -622,7 +622,7 @@ impl Inner {
             self.actions
                 .send
                 .recv_connection_window_update(frame, &mut self.store, &mut self.counts)
-                .map_err(RecvError::Connection)?;
+                .map_err(Error::Ours)?;
         } else {
             // The remote may send window updates for streams that the local now
             // considers closed. It's ok...
@@ -640,14 +640,14 @@ impl Inner {
             } else {
                 self.actions
                     .ensure_not_idle(self.counts.peer(), id)
-                    .map_err(RecvError::Connection)?;
+                    .map_err(Error::Ours)?;
             }
         }
 
         Ok(())
     }
 
-    fn recv_err<B>(&mut self, send_buffer: &SendBuffer<B>, err: &proto::Error) -> StreamId {
+    fn handle_error<B>(&mut self, send_buffer: &SendBuffer<B>, err: &proto::Error) -> StreamId {
         let actions = &mut self.actions;
         let counts = &mut self.counts;
         let mut send_buffer = send_buffer.inner.lock().unwrap();
@@ -658,8 +658,8 @@ impl Inner {
         self.store
             .for_each(|stream| {
                 counts.transition(stream, |counts, stream| {
-                    actions.recv.recv_err(err, &mut *stream);
-                    actions.send.recv_err(send_buffer, stream, counts);
+                    actions.recv.handle_error(err, &mut *stream);
+                    actions.send.handle_error(send_buffer, stream, counts);
                     Ok::<_, ()>(())
                 })
             })
@@ -684,14 +684,14 @@ impl Inner {
 
         actions.send.recv_go_away(last_stream_id)?;
 
-        let err = frame.reason().into();
+        let err = Error::Theirs(frame.reason());
 
         self.store
             .for_each(|stream| {
                 if stream.id > last_stream_id {
                     counts.transition(stream, |counts, stream| {
-                        actions.recv.recv_err(&err, &mut *stream);
-                        actions.send.recv_err(send_buffer, stream, counts);
+                        actions.recv.handle_error(&err, &mut *stream);
+                        actions.send.handle_error(send_buffer, stream, counts);
                         Ok::<_, ()>(())
                     })
                 } else {
@@ -733,7 +733,7 @@ impl Inner {
             }
             None => {
                 proto_err!(conn: "recv_push_promise: initiating stream is in an invalid state");
-                return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+                return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
             }
         };
 
@@ -826,7 +826,7 @@ impl Inner {
 
                     // This handles resetting send state associated with the
                     // stream
-                    actions.send.recv_err(send_buffer, stream, counts);
+                    actions.send.handle_error(send_buffer, stream, counts);
                     Ok::<_, ()>(())
                 })
             })

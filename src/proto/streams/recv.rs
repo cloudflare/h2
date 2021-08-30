@@ -1,7 +1,7 @@
 use super::*;
 use crate::codec::{RecvError, UserError};
-use crate::frame::{PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
-use crate::{frame, proto};
+use crate::frame::{self, PushPromiseHeaderError, Reason, DEFAULT_INITIAL_WINDOW_SIZE};
+use crate::proto::{self, Error};
 use std::task::Context;
 
 use http::{HeaderMap, Request, Response};
@@ -130,7 +130,7 @@ impl Recv {
         id: StreamId,
         mode: Open,
         counts: &mut Counts,
-    ) -> Result<Option<StreamId>, RecvError> {
+    ) -> Result<Option<StreamId>, Error> {
         assert!(self.refused.is_none());
 
         counts.peer().ensure_can_open(id, mode)?;
@@ -138,7 +138,7 @@ impl Recv {
         let next_id = self.next_stream_id()?;
         if id < next_id {
             proto_err!(conn: "id ({:?}) < next_id ({:?})", id, next_id);
-            return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+            return Err(Error::Ours(Reason::PROTOCOL_ERROR));
         }
 
         self.next_stream_id = id.next_id();
@@ -461,7 +461,7 @@ impl Recv {
         &mut self,
         settings: &frame::Settings,
         store: &mut Store,
-    ) -> Result<(), RecvError> {
+    ) -> Result<(), proto::Error> {
         let target = if let Some(val) = settings.initial_window_size() {
             val
         } else {
@@ -508,7 +508,7 @@ impl Recv {
                 stream
                     .recv_flow
                     .inc_window(inc)
-                    .map_err(RecvError::Connection)?;
+                    .map_err(proto::Error::Ours)?;
                 stream.recv_flow.assign_capacity(inc);
                 Ok(())
             })
@@ -548,7 +548,7 @@ impl Recv {
             // Receiving a DATA frame when not expecting one is a protocol
             // error.
             proto_err!(conn: "unexpected DATA frame; stream={:?}", stream.id);
-            return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+            return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
         }
 
         tracing::trace!(
@@ -563,7 +563,7 @@ impl Recv {
                 "recv_data; frame ignored on locally reset {:?} for some time",
                 stream.id,
             );
-            return self.ignore_data(sz);
+            return Ok(self.ignore_data(sz)?);
         }
 
         // Ensure that there is enough capacity on the connection before acting
@@ -612,7 +612,7 @@ impl Recv {
 
             if stream.state.recv_close().is_err() {
                 proto_err!(conn: "recv_data: failed to transition to closed state; stream={:?}", stream.id);
-                return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+                return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
             }
         }
 
@@ -631,7 +631,7 @@ impl Recv {
         Ok(())
     }
 
-    pub fn ignore_data(&mut self, sz: WindowSize) -> Result<(), RecvError> {
+    pub fn ignore_data(&mut self, sz: WindowSize) -> Result<(), Error> {
         // Ensure that there is enough capacity on the connection...
         self.consume_connection_window(sz)?;
 
@@ -647,14 +647,14 @@ impl Recv {
         Ok(())
     }
 
-    pub fn consume_connection_window(&mut self, sz: WindowSize) -> Result<(), RecvError> {
+    pub fn consume_connection_window(&mut self, sz: WindowSize) -> Result<(), Error> {
         if self.flow.window_size() < sz {
             tracing::debug!(
                 "connection error FLOW_CONTROL_ERROR -- window_size ({:?}) < sz ({:?});",
                 self.flow.window_size(),
                 sz,
             );
-            return Err(RecvError::Connection(Reason::FLOW_CONTROL_ERROR));
+            return Err(Error::Ours(Reason::FLOW_CONTROL_ERROR));
         }
 
         // Update connection level flow control
@@ -747,18 +747,16 @@ impl Recv {
     /// Handle remote sending an explicit RST_STREAM.
     pub fn recv_reset(&mut self, frame: frame::Reset, stream: &mut Stream) {
         // Notify the stream
-        stream
-            .state
-            .recv_reset(frame.reason(), stream.is_pending_send);
+        stream.state.recv_reset(frame, stream.is_pending_send);
 
         stream.notify_send();
         stream.notify_recv();
     }
 
-    /// Handle a received error
-    pub fn recv_err(&mut self, err: &proto::Error, stream: &mut Stream) {
+    /// Handle a connection-level error
+    pub fn handle_error(&mut self, err: &proto::Error, stream: &mut Stream) {
         // Receive an error
-        stream.state.recv_err(err);
+        stream.state.handle_error(err);
 
         // If a receiver is waiting, notify it
         stream.notify_send();
@@ -789,11 +787,11 @@ impl Recv {
         self.max_stream_id
     }
 
-    pub fn next_stream_id(&self) -> Result<StreamId, RecvError> {
+    pub fn next_stream_id(&self) -> Result<StreamId, Error> {
         if let Ok(id) = self.next_stream_id {
             Ok(id)
         } else {
-            Err(RecvError::Connection(Reason::PROTOCOL_ERROR))
+            Err(Error::Ours(Reason::PROTOCOL_ERROR))
         }
     }
 
@@ -808,10 +806,10 @@ impl Recv {
     }
 
     /// Returns true if the remote peer can reserve a stream with the given ID.
-    pub fn ensure_can_reserve(&self) -> Result<(), RecvError> {
+    pub fn ensure_can_reserve(&self) -> Result<(), Error> {
         if !self.is_push_enabled {
             proto_err!(conn: "recv_push_promise: push is disabled");
-            return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+            return Err(Error::Ours(Reason::PROTOCOL_ERROR));
         }
 
         Ok(())
@@ -1101,5 +1099,11 @@ impl Open {
 impl<T> From<RecvError> for RecvHeaderBlockError<T> {
     fn from(err: RecvError) -> Self {
         RecvHeaderBlockError::State(err)
+    }
+}
+
+impl<T> From<Error> for RecvHeaderBlockError<T> {
+    fn from(err: Error) -> Self {
+        RecvError::Connection(err).into()
     }
 }

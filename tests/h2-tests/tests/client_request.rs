@@ -672,7 +672,7 @@ async fn sending_request_on_closed_connection() {
         };
 
         let poll_err = poll_fn(|cx| client.poll_ready(cx)).await.unwrap_err();
-        let msg = "protocol error: unspecific protocol error detected";
+        let msg = "local error: unspecific protocol error detected";
         assert_eq!(poll_err.to_string(), msg);
 
         let request = Request::builder()

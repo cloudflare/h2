@@ -23,10 +23,11 @@ pub struct Error {
 #[derive(Debug)]
 enum Kind {
     /// An error caused by an action taken by the remote peer.
-    ///
-    /// This is either an error received by the peer or caused by an invalid
-    /// action taken by the peer (i.e. a protocol error).
-    Proto(Reason),
+    Remote(Reason),
+
+    /// An error caused by an invalid action taken by the peer
+    /// (i.e. a protocol error).
+    Local(Reason),
 
     /// An error resulting from an invalid action taken by the user of this
     /// library.
@@ -45,7 +46,7 @@ impl Error {
     /// action taken by the peer (i.e. a protocol error).
     pub fn reason(&self) -> Option<Reason> {
         match self.kind {
-            Kind::Proto(reason) => Some(reason),
+            Kind::Local(reason) | Kind::Remote(reason) => Some(reason),
             _ => None,
         }
     }
@@ -87,7 +88,8 @@ impl From<proto::Error> for Error {
 
         Error {
             kind: match src {
-                Proto(reason) => Kind::Proto(reason),
+                Ours(reason) => Kind::Local(reason),
+                Theirs(reason) => Kind::Remote(reason),
                 Io(e) => Kind::Io(e),
             },
         }
@@ -97,7 +99,7 @@ impl From<proto::Error> for Error {
 impl From<Reason> for Error {
     fn from(src: Reason) -> Error {
         Error {
-            kind: Kind::Proto(src),
+            kind: Kind::Local(src),
         }
     }
 }
@@ -106,8 +108,7 @@ impl From<SendError> for Error {
     fn from(src: SendError) -> Error {
         match src {
             SendError::User(e) => e.into(),
-            SendError::Connection(reason) => reason.into(),
-            SendError::Io(e) => Error::from_io(e),
+            SendError::Connection(e) => e.into(),
         }
     }
 }
@@ -122,12 +123,11 @@ impl From<UserError> for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        use self::Kind::*;
-
         match self.kind {
-            Proto(ref reason) => write!(fmt, "protocol error: {}", reason),
-            User(ref e) => write!(fmt, "user error: {}", e),
-            Io(ref e) => fmt::Display::fmt(e, fmt),
+            Kind::Local(ref reason) => write!(fmt, "local error: {}", reason),
+            Kind::Remote(ref reason) => write!(fmt, "remote error: {}", reason),
+            Kind::User(ref e) => write!(fmt, "user error: {}", e),
+            Kind::Io(ref e) => e.fmt(fmt),
         }
     }
 }

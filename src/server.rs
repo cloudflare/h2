@@ -117,7 +117,7 @@
 
 use crate::codec::{Codec, RecvError, UserError};
 use crate::frame::{self, Pseudo, PushPromiseHeaderError, Reason, Settings, StreamId};
-use crate::proto::{self, Config, Prioritized};
+use crate::proto::{self, Config, Error, Prioritized};
 use crate::{FlowControl, PingPong, RecvStream, SendStream};
 
 use bytes::{Buf, Bytes};
@@ -1416,7 +1416,7 @@ impl proto::Peer for Peer {
         // Specifying :status for a request is a protocol error
         if pseudo.status.is_some() {
             tracing::trace!("malformed headers: :status field on request; PROTOCOL_ERROR");
-            return Err(RecvError::Connection(Reason::PROTOCOL_ERROR));
+            return Err(Error::Ours(Reason::PROTOCOL_ERROR).into());
         }
 
         // Convert the URI
