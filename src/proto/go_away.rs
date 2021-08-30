@@ -12,33 +12,11 @@ pub(super) struct GoAway {
     /// Whether the connection should close now, or wait until idle.
     close_now: bool,
     /// Records if we've sent any GOAWAY before.
-    going_away: Option<GoingAway>,
+    going_away: Option<frame::GoAway>,
     /// Whether the user started the GOAWAY by calling `abrupt_shutdown`.
     is_user_initiated: bool,
     /// A GOAWAY frame that must be buffered in the Codec immediately.
     pending: Option<frame::GoAway>,
-}
-
-/// Keeps a memory of any GOAWAY frames we've sent before.
-///
-/// This looks very similar to a `frame::GoAway`, but is a separate type. Why?
-/// Mostly for documentation purposes. This type is to record status. If it
-/// were a `frame::GoAway`, it might appear like we eventually wanted to
-/// serialize it. We **only** want to be able to look up these fields at a
-/// later time.
-///
-/// (Technically, `frame::GoAway` should gain an opaque_debug_data field as
-/// well, and we wouldn't want to save that here to accidentally dump in logs,
-/// or waste struct space.)
-#[derive(Debug)]
-struct GoingAway {
-    /// Stores the highest stream ID of a GOAWAY that has been sent.
-    ///
-    /// It's illegal to send a subsequent GOAWAY with a higher ID.
-    last_processed_id: StreamId,
-
-    /// Records the error code of any GOAWAY frame sent.
-    reason: Reason,
 }
 
 impl GoAway {
@@ -57,18 +35,15 @@ impl GoAway {
     pub fn go_away(&mut self, f: frame::GoAway) {
         if let Some(ref going_away) = self.going_away {
             assert!(
-                f.last_stream_id() <= going_away.last_processed_id,
+                f.last_stream_id() <= going_away.last_stream_id(),
                 "GOAWAY stream IDs shouldn't be higher; \
                  last_processed_id = {:?}, f.last_stream_id() = {:?}",
-                going_away.last_processed_id,
+                going_away.last_stream_id(),
                 f.last_stream_id(),
             );
         }
 
-        self.going_away = Some(GoingAway {
-            last_processed_id: f.last_stream_id(),
-            reason: f.reason(),
-        });
+        self.going_away = Some(f.clone());
         self.pending = Some(f);
     }
 
@@ -76,7 +51,8 @@ impl GoAway {
         self.close_now = true;
         if let Some(ref going_away) = self.going_away {
             // Prevent sending the same GOAWAY twice.
-            if going_away.last_processed_id == f.last_stream_id() && going_away.reason == f.reason()
+            if going_away.last_stream_id() == f.last_stream_id()
+                && going_away.reason() == f.reason()
             {
                 return;
             }
@@ -99,8 +75,8 @@ impl GoAway {
     }
 
     /// Return the last Reason we've sent.
-    pub fn going_away_reason(&self) -> Option<Reason> {
-        self.going_away.as_ref().map(|g| g.reason)
+    pub fn going_away(&self) -> Option<&frame::GoAway> {
+        self.going_away.as_ref()
     }
 
     /// Returns if the connection should close now, or wait until idle.
@@ -114,7 +90,7 @@ impl GoAway {
             && self
                 .going_away
                 .as_ref()
-                .map(|g| g.last_processed_id != StreamId::MAX)
+                .map(|g| g.last_stream_id() != StreamId::MAX)
                 .unwrap_or(false)
     }
 
@@ -141,7 +117,7 @@ impl GoAway {
 
             return Poll::Ready(Some(Ok(reason)));
         } else if self.should_close_now() {
-            return match self.going_away_reason() {
+            return match self.going_away().map(frame::GoAway::reason) {
                 Some(reason) => Poll::Ready(Some(Ok(reason))),
                 None => Poll::Ready(None),
             };

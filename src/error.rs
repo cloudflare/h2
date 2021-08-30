@@ -1,6 +1,9 @@
 use crate::codec::{SendError, UserError};
-use crate::proto;
+use crate::frame::StreamId;
+use crate::proto::{self, Initiator};
 
+use bytes::Bytes;
+use std::sync::Arc;
 use std::{error, fmt, io};
 
 pub use crate::frame::Reason;
@@ -22,18 +25,21 @@ pub struct Error {
 
 #[derive(Debug)]
 enum Kind {
-    /// An error caused by an action taken by the remote peer.
-    ///
-    /// This is either an error received by the peer or caused by an invalid
-    /// action taken by the peer (i.e. a protocol error).
-    Proto(Reason),
+    /// A RST_STREAM frame was received or sent.
+    Reset(StreamId, Reason, Initiator),
+
+    /// A GO_AWAY frame was received or sent.
+    GoAway(Bytes, Reason, Initiator),
+
+    /// The user created an error from a bare Reason.
+    Reason(Reason),
 
     /// An error resulting from an invalid action taken by the user of this
     /// library.
     User(UserError),
 
     /// An `io::Error` occurred while trying to read or write.
-    Io(io::Error),
+    Io(Arc<io::Error>),
 }
 
 // ===== impl Error =====
@@ -45,7 +51,7 @@ impl Error {
     /// action taken by the peer (i.e. a protocol error).
     pub fn reason(&self) -> Option<Reason> {
         match self.kind {
-            Kind::Proto(reason) => Some(reason),
+            Kind::Reset(_, reason, _) | Kind::GoAway(_, reason, _) => Some(reason),
             _ => None,
         }
     }
@@ -69,14 +75,14 @@ impl Error {
     /// Returns the error if the error is an io::Error
     pub fn into_io(self) -> Option<io::Error> {
         match self.kind {
-            Kind::Io(e) => Some(e),
+            Kind::Io(e) => Some(io::Error::new(e.kind(), e.to_string())),
             _ => None,
         }
     }
 
     pub(crate) fn from_io(err: io::Error) -> Self {
         Error {
-            kind: Kind::Io(err),
+            kind: Kind::Io(Arc::new(err)),
         }
     }
 }
@@ -87,7 +93,10 @@ impl From<proto::Error> for Error {
 
         Error {
             kind: match src {
-                Proto(reason) => Kind::Proto(reason),
+                Reset(stream_id, reason, initiator) => Kind::Reset(stream_id, reason, initiator),
+                GoAway(debug_data, reason, initiator) => {
+                    Kind::GoAway(debug_data, reason, initiator)
+                }
                 Io(e) => Kind::Io(e),
             },
         }
@@ -97,7 +106,7 @@ impl From<proto::Error> for Error {
 impl From<Reason> for Error {
     fn from(src: Reason) -> Error {
         Error {
-            kind: Kind::Proto(src),
+            kind: Kind::Reason(src),
         }
     }
 }
@@ -106,8 +115,7 @@ impl From<SendError> for Error {
     fn from(src: SendError) -> Error {
         match src {
             SendError::User(e) => e.into(),
-            SendError::Connection(reason) => reason.into(),
-            SendError::Io(e) => Error::from_io(e),
+            SendError::Connection(e) => e.into(),
         }
     }
 }
@@ -122,12 +130,20 @@ impl From<UserError> for Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        use self::Kind::*;
-
         match self.kind {
-            Proto(ref reason) => write!(fmt, "protocol error: {}", reason),
-            User(ref e) => write!(fmt, "user error: {}", e),
-            Io(ref e) => fmt::Display::fmt(e, fmt),
+            Kind::Reset(_, reason, initiator) => {
+                write!(fmt, "stream reset by {}: {}", initiator, reason)
+            }
+            Kind::GoAway(ref debug_data, reason, initiator) => {
+                write!(fmt, "go away from {}: {}", initiator, reason)?;
+                if !debug_data.is_empty() {
+                    write!(fmt, " ({:?})", debug_data)?;
+                }
+                Ok(())
+            }
+            Kind::Reason(reason) => write!(fmt, "protocol error: {}", reason),
+            Kind::User(ref e) => write!(fmt, "user error: {}", e),
+            Kind::Io(ref e) => e.fmt(fmt),
         }
     }
 }
