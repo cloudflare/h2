@@ -51,6 +51,12 @@ pub(super) struct Prioritize {
 
     /// What `DATA` frame is currently being sent in the codec.
     in_flight_data_frame: InFlightData,
+
+    /// The max send buffer size allowed.
+    max_send_buffer_size: usize,
+
+    /// The current send buffer size.
+    current_send_buffer_size: usize,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -93,7 +99,15 @@ impl Prioritize {
             flow,
             last_opened_id: StreamId::ZERO,
             in_flight_data_frame: InFlightData::Nothing,
+            max_send_buffer_size: usize::MAX,
+            current_send_buffer_size: 0,
         }
+    }
+
+    pub fn set_max_send_buffer_size(&mut self, max: usize, store: &mut Store, counts: &mut Counts) {
+        self.max_send_buffer_size = max;
+
+        self.assign_connection_capacity(0, store, counts);
     }
 
     /// Queue a frame to be sent to the remote
@@ -156,6 +170,8 @@ impl Prioritize {
                 return Err(UnexpectedFrameType);
             }
         }
+
+        self.current_send_buffer_size += sz as usize;
 
         // Update the buffered data counter
         stream.buffered_send_data += sz as usize;
@@ -350,7 +366,7 @@ impl Prioritize {
         self.flow.assign_capacity(inc);
 
         // Assign newly acquired capacity to streams pending capacity.
-        while self.flow.available() > 0 {
+        while self.available() > 0 {
             let stream = match self.pending_capacity.pop(store) {
                 Some(stream) => stream,
                 None => return,
@@ -371,6 +387,17 @@ impl Prioritize {
                 self.try_assign_capacity(&mut stream);
             })
         }
+    }
+
+    pub(crate) fn available(&self) -> WindowSize {
+        cmp::min(
+            self.flow.available().as_size() as usize,
+            cmp::min(
+                self.max_send_buffer_size
+                    .saturating_sub(self.current_send_buffer_size),
+                WindowSize::MAX as usize,
+            ),
+        ) as WindowSize
     }
 
     /// Request capacity to send data
@@ -413,7 +440,7 @@ impl Prioritize {
         );
 
         // The amount of currently available capacity on the connection
-        let conn_available = self.flow.available().as_size();
+        let conn_available = self.available();
 
         // First check if capacity is immediately available
         if conn_available > 0 {
@@ -630,6 +657,8 @@ impl Prioritize {
             tracing::trace!(?frame, "dropping");
         }
 
+        self.current_send_buffer_size -= stream.buffered_send_data;
+
         stream.buffered_send_data = 0;
         stream.requested_send_capacity = 0;
         if let InFlightData::DataFrame(key) = self.in_flight_data_frame {
@@ -735,6 +764,8 @@ impl Prioritize {
                             // Update the flow control
                             tracing::trace_span!("updating stream flow").in_scope(|| {
                                 stream.send_flow.send_data(len);
+
+                                self.current_send_buffer_size -= len as usize;
 
                                 // Decrement the stream's buffered data counter
                                 debug_assert!(stream.buffered_send_data >= len as usize);
