@@ -11,7 +11,7 @@ use http;
 use std::task::{Context, Poll, Waker};
 use tokio::io::AsyncWrite;
 
-use std::io;
+use std::{cmp, io};
 
 /// Manages state transitions related to outbound frames.
 #[derive(Debug)]
@@ -116,6 +116,10 @@ impl Send {
             .queue_frame(frame.into(), buffer, stream, task);
 
         Ok(())
+    }
+
+    pub fn set_max_send_buffer_size(&mut self, max: usize, store: &mut Store, counts: &mut Counts) {
+        self.prioritize.set_max_send_buffer_size(max, store, counts);
     }
 
     pub fn send_headers<B>(
@@ -335,7 +339,10 @@ impl Send {
         if available as usize <= buffered {
             0
         } else {
-            available - buffered as WindowSize
+            cmp::min(
+                available - buffered as WindowSize,
+                self.prioritize.available(),
+            )
         }
     }
 
